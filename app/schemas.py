@@ -100,6 +100,14 @@ class BahanBakuUpdate(BahanBakuCreate):
     pass
 
 
+class PembelianBahanBakuCreate(BaseModel):
+    id_bahan: int
+    tanggal_pembelian: date
+    jumlah_pembelian: Decimal = Field(gt=0)
+    harga_total: Decimal = Field(gt=0)
+    catatan: Optional[str] = None
+
+
 class ProduksiCreate(BaseModel):
     id_resep: int
     tanggal_produksi: date

@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime, time
 from decimal import Decimal
 from math import ceil
 from pathlib import Path
@@ -22,6 +22,7 @@ from app.schemas import (BahanBakuCreate, BahanBakuUpdate, DataHarianBatchCreate
                          ResepBahanUpdate, ResepCreate, ResepUpdate, PrediksiBatchConfirm,
                          PrediksiConfirm,
                          StockOpnameCreate, TransaksiKeuanganCreate,
+                         PembelianBahanBakuCreate,
                          TransaksiKeuanganUpdate)
 
 app = FastAPI(title="API Prediksi Suplai Puding", version="2.0.0")
@@ -765,6 +766,57 @@ def deactivate_bahan_baku(id_bahan: int, db: Session = Depends(get_db)):
     db.commit()
     return {"status": "berhasil",
             "message": "Bahan dinonaktifkan; riwayat stok tetap tersimpan"}
+
+
+@app.post("/pembelian-bahan-baku", status_code=201)
+def create_material_purchase(req: PembelianBahanBakuCreate,
+                             db: Session = Depends(get_db)):
+    material = (db.query(BahanBaku).filter(
+        BahanBaku.id_bahan == req.id_bahan,
+        BahanBaku.status == "aktif").first())
+    if not material:
+        raise HTTPException(404, "Bahan baku aktif tidak ditemukan")
+
+    isi = Decimal(material.isi_per_pembelian or 1)
+    jumlah_masuk = req.jumlah_pembelian * isi
+    harga_satuan = req.harga_total / jumlah_masuk
+    mutation = MutasiStok(
+        id_bahan=req.id_bahan,
+        tanggal_mutasi=datetime.combine(req.tanggal_pembelian, time.min),
+        jenis_mutasi="pembelian",
+        jumlah_masuk=jumlah_masuk,
+        jumlah_keluar=0,
+        harga_satuan=harga_satuan,
+        referensi_tipe="pembelian_bahan_baku",
+        catatan=req.catatan,
+    )
+    db.add(mutation)
+
+    category = (db.query(KategoriKeuangan).filter(
+        KategoriKeuangan.nama_kategori == "Pembelian bahan baku",
+        KategoriKeuangan.jenis == "pengeluaran",
+        KategoriKeuangan.status == "aktif").first())
+    if category is None:
+        category = KategoriKeuangan(nama_kategori="Pembelian bahan baku",
+                                    jenis="pengeluaran", status="aktif")
+        db.add(category)
+        db.flush()
+    finance = TransaksiKeuangan(
+        id_kategori=category.id_kategori,
+        tanggal_transaksi=req.tanggal_pembelian,
+        nominal=req.harga_total,
+        deskripsi=req.catatan or f"Pembelian {material.nama_bahan}",
+    )
+    db.add(finance)
+    db.commit()
+    db.refresh(mutation)
+    return {"status": "berhasil",
+            "message": "Pembelian bahan baku berhasil disimpan",
+            "data": {"id_mutasi": mutation.id_mutasi,
+                     "id_bahan": req.id_bahan,
+                     "jumlah_pembelian": req.jumlah_pembelian,
+                     "jumlah_masuk": jumlah_masuk,
+                     "harga_total": req.harga_total}}
 
 
 def _recipe_json(db: Session, recipe: Resep):
