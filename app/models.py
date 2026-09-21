@@ -86,12 +86,12 @@ class BahanBaku(Base):
 
     id_bahan = Column(Integer, primary_key=True)
     nama_bahan = Column(String(100), unique=True, nullable=False)
-    satuan = Column(String(20), nullable=False)
-    satuan_pembelian = Column(String(30))
-    isi_per_pembelian = Column(Numeric(12, 3), nullable=False, default=1)
-    label_pembelian = Column(String(50))
-    stok_minimum = Column(Numeric(12, 2), nullable=False, default=0)
-    harga_per_satuan = Column(Numeric(15, 2), nullable=False, default=0)
+    satuan_resep = Column(String(20), nullable=False)
+    satuan_beli = Column(String(30))
+    rasio_konversi = Column(Integer, nullable=False, default=1)
+    harga_beli = Column(Integer, nullable=False, default=0)
+    stok_minimum = Column(Integer, nullable=False, default=0)
+    harga_per_satuan_resep = Column(Integer, nullable=False, default=0)
     status = Column(Enum("aktif", "nonaktif"), nullable=False, default="aktif")
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
@@ -110,6 +110,27 @@ class MutasiStok(Base):
     referensi_tipe = Column(String(50))
     referensi_id = Column(BigInteger)
     catatan = Column(String(255))
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class StokBatch(Base):
+    __tablename__ = "stok_batch"
+
+    id_batch = Column(Integer, primary_key=True)
+    jumlah_awal = Column(Integer, nullable=False)
+    jumlah_sisa = Column(Integer, nullable=False)
+    tanggal_kadaluarsa = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class LogStokRusak(Base):
+    __tablename__ = "log_stok_rusak"
+
+    id_log = Column(Integer, primary_key=True)
+    id_batch = Column(Integer, ForeignKey("stok_batch.id_batch"), nullable=False)
+    jumlah_rusak = Column(Integer, nullable=False)
+    alasan = Column(String(255), nullable=False)
     created_at = Column(DateTime, server_default=func.now())
 
 
@@ -143,6 +164,7 @@ class Produk(Base):
     nama_produk = Column(String(100), unique=True, nullable=False)
     metode_perencanaan = Column(Enum("prediksi", "manual"), nullable=False)
     disuplai_ke_mitra = Column(Boolean, nullable=False, default=False)
+    harga_jual_per_potong = Column(Numeric(15, 2), nullable=False, default=0)
     status = Column(Enum("aktif", "nonaktif"), nullable=False, default="aktif")
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
@@ -207,6 +229,7 @@ class KategoriKeuangan(Base):
     id_kategori = Column(Integer, primary_key=True)
     nama_kategori = Column(String(100), nullable=False)
     jenis = Column(Enum("pemasukan", "pengeluaran"), nullable=False)
+    sumber = Column(Enum("otomatis", "manual"), nullable=False, default="manual")
     status = Column(Enum("aktif", "nonaktif"), nullable=False, default="aktif")
     created_at = Column(DateTime, server_default=func.now())
 
@@ -216,9 +239,11 @@ class TransaksiKeuangan(Base):
 
     id_transaksi = Column(BigInteger, primary_key=True)
     id_kategori = Column(Integer, ForeignKey("kategori_keuangan.id_kategori"), nullable=False)
-    id_mitra = Column(Integer, ForeignKey("mitra.id_mitra"))
     tanggal_transaksi = Column(Date, nullable=False)
     nominal = Column(Numeric(15, 2), nullable=False)
-    deskripsi = Column(String(255))
+    catatan = Column(String(255))
+    sumber = Column(Enum("otomatis", "manual"), nullable=False, default="manual")
+    referensi_tipe = Column(String(50))
+    referensi_id = Column(BigInteger)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

@@ -65,10 +65,9 @@ class StockOpnameCreate(BaseModel):
 
 class TransaksiKeuanganCreate(BaseModel):
     id_kategori: int
-    id_mitra: Optional[int] = None
     tanggal_transaksi: date
     nominal: Decimal = Field(gt=0)
-    deskripsi: Optional[str] = None
+    catatan: Optional[str] = None
 
 
 class TransaksiKeuanganUpdate(TransaksiKeuanganCreate):
@@ -87,12 +86,12 @@ class MitraUpdate(BaseModel):
 
 class BahanBakuCreate(BaseModel):
     nama_bahan: str = Field(min_length=2, max_length=100)
-    satuan: str = Field(min_length=1, max_length=20)
-    satuan_pembelian: Optional[str] = Field(default=None, max_length=30)
-    isi_per_pembelian: Decimal = Field(default=1, gt=0)
-    label_pembelian: Optional[str] = Field(default=None, max_length=50)
-    stok_minimum: Decimal = Field(ge=0)
-    harga_per_satuan: Decimal = Field(ge=0)
+    satuan_resep: str = Field(min_length=1, max_length=20)
+    satuan_beli: Optional[str] = Field(default=None, max_length=30)
+    rasio_konversi: int = Field(default=1, gt=0)
+    harga_beli: int = Field(default=0, ge=0)
+    stok_minimum: int = Field(default=0, ge=0)
+    harga_per_satuan_resep: int = Field(default=0, ge=0)
     status: Literal["aktif", "nonaktif"] = "aktif"
 
 
@@ -105,6 +104,8 @@ class PembelianBahanBakuCreate(BaseModel):
     tanggal_pembelian: date
     jumlah_pembelian: Decimal = Field(gt=0)
     harga_total: Decimal = Field(gt=0)
+    ubah_harga_beli: bool = False
+    harga_beli_baru: Optional[int] = Field(default=None, gt=0)
     catatan: Optional[str] = None
 
 
@@ -116,6 +117,15 @@ class ProduksiCreate(BaseModel):
     sumber_produksi: Literal["prediksi", "manual"] = "manual"
     jumlah_diminta: Optional[int] = Field(default=None, ge=1)
     id_prediksi: Optional[int] = None
+
+
+class PrediksiProductionCreate(BaseModel):
+    tanggal_produksi: date
+
+
+class ProduksiEksekusiCreate(BaseModel):
+    prediksi_kebutuhan: int = Field(gt=0)
+    stok_manual_dipakai: Optional[int] = Field(default=None, ge=0)
 
 
 class ResepCreate(BaseModel):
