@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import case, extract, func
+from sqlalchemy import extract, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -43,6 +43,12 @@ DEFAULT_TRAY_CAPACITY = 33
 AUTOMATIC_SALES_NOTE = "[Otomatis] Penjualan puding seluruh mitra"
 AUTOMATIC_RETURN_NOTE = "[Otomatis] Return puding seluruh mitra"
 AUTOMATIC_MATERIAL_NOTE = "[Otomatis] Pemakaian bahan baku"
+
+
+def _is_cash_transaction(transaction, category):
+    """Pemakaian bahan dan puding tidak terjual tidak memindahkan uang."""
+    return not (transaction.sumber == "otomatis" and
+                category.nama_kategori in ("Pemakaian bahan baku", "Return puding"))
 
 
 def _finance_category(db: Session, name: str, kind: str):
@@ -301,9 +307,9 @@ def get_dashboard(db: Session = Depends(get_db)):
         .all()
     )
     income = sum(float(row.nominal) for row, category in finance_rows
-                 if category.jenis == "pemasukan")
+                 if category.jenis == "pemasukan" and _is_cash_transaction(row, category))
     expense = sum(float(row.nominal) for row, category in finance_rows
-                  if category.jenis == "pengeluaran")
+                  if category.jenis == "pengeluaran" and _is_cash_transaction(row, category))
     return {
         "tanggal_data_terakhir": latest,
         "total_mitra": int(mitra_count),
@@ -325,6 +331,7 @@ def get_dashboard(db: Session = Depends(get_db)):
         "keuangan_hari_ini": {
             "pemasukan": income,
             "pengeluaran": expense,
+            "arus_kas_bersih": income - expense,
             "laba_bersih": income - expense,
         },
     }
@@ -1792,15 +1799,16 @@ def list_finance(
     rows = query.order_by(TransaksiKeuangan.tanggal_transaksi.desc(),
                           TransaksiKeuangan.id_transaksi.desc()).limit(
                               limit).all()
-    masuk = sum(float(t.nominal) for t, k in rows if k.jenis == "pemasukan")
-    keluar = sum(float(t.nominal) for t, k in rows if k.jenis == "pengeluaran")
+    masuk = sum(float(t.nominal) for t, k in rows if k.jenis == "pemasukan" and _is_cash_transaction(t, k))
+    keluar = sum(float(t.nominal) for t, k in rows if k.jenis == "pengeluaran" and _is_cash_transaction(t, k))
     return {"jumlah": len(rows), "total_masuk": masuk, "total_keluar": keluar,
             "data": [{"id_transaksi": t.id_transaksi,
                       "id_kategori": t.id_kategori,
                       "tanggal_transaksi": t.tanggal_transaksi,
                       "kategori": k.nama_kategori, "jenis": k.jenis,
                       "nominal": float(t.nominal), "catatan": t.catatan,
-                      "sumber": t.sumber}
+                      "sumber": t.sumber,
+                      "mempengaruhi_kas": _is_cash_transaction(t, k)}
                      for t, k in rows]}
 
 
@@ -1867,46 +1875,52 @@ def get_finance(tanggal: date = Query(default_factory=date.today),
             .filter(TransaksiKeuangan.tanggal_transaksi >= start,
                     TransaksiKeuangan.tanggal_transaksi <= end)
             .order_by(TransaksiKeuangan.id_transaksi.desc()).all())
-    income = sum(float(t.nominal) for t, k in rows if k.jenis == "pemasukan")
-    expense = sum(float(t.nominal) for t, k in rows if k.jenis == "pengeluaran")
-    profit = income - expense
-    # Rincian pemasukan & pengeluaran per tanggal sepanjang periode filter.
-    # Dipakai grafik: batang untuk mode harian dan garis pemasukan/pengeluaran
-    # untuk mode mingguan, bulanan, dan rentang tanggal.
-    daily_rows = (db.query(
-        TransaksiKeuangan.tanggal_transaksi,
-        func.sum(case((KategoriKeuangan.jenis == "pemasukan",
-                       TransaksiKeuangan.nominal),
-                      else_=0)).label("pemasukan"),
-        func.sum(case((KategoriKeuangan.jenis == "pengeluaran",
-                       TransaksiKeuangan.nominal),
-                      else_=0)).label("pengeluaran"))
-        .join(KategoriKeuangan)
-        .filter(TransaksiKeuangan.tanggal_transaksi >= start,
-                TransaksiKeuangan.tanggal_transaksi <= end)
-        .group_by(TransaksiKeuangan.tanggal_transaksi).all())
-    daily_map = {x.tanggal_transaksi: x for x in daily_rows}
+    income = sum(float(t.nominal) for t, k in rows if k.jenis == "pemasukan" and _is_cash_transaction(t, k))
+    expense = sum(float(t.nominal) for t, k in rows if k.jenis == "pengeluaran" and _is_cash_transaction(t, k))
+    cash_balance = income - expense
+    daily_map = {}
+    for transaction, category in rows:
+        if not _is_cash_transaction(transaction, category):
+            continue
+        daily = daily_map.setdefault(transaction.tanggal_transaksi,
+                                     {"pemasukan": 0.0, "pengeluaran": 0.0})
+        daily[category.jenis] += float(transaction.nominal)
+    material_usage = sum(float(t.nominal) for t, k in rows
+                         if t.sumber == "otomatis" and
+                         k.nama_kategori == "Pemakaian bahan baku")
+    return_value = sum(float(t.nominal) for t, k in rows
+                       if t.sumber == "otomatis" and k.nama_kategori == "Return puding")
+    inventory_value = sum(max(0, float(balance)) * float(material.harga_per_satuan_resep or 0)
+                          for material, balance in _stock_query(db).all())
     trend = []
     current = start
     while current <= end:
         row = daily_map.get(current)
-        income_day = float(row.pemasukan or 0) if row else 0
-        expense_day = float(row.pengeluaran or 0) if row else 0
+        income_day = row["pemasukan"] if row else 0
+        expense_day = row["pengeluaran"] if row else 0
         trend.append({"tanggal": current,
                       "pemasukan": income_day,
                       "pengeluaran": expense_day,
+                      "arus_kas_bersih": income_day - expense_day,
                       "laba": income_day - expense_day})
         current += timedelta(days=1)
     return {"tanggal": tanggal,
             "tanggal_mulai": start, "tanggal_selesai": end,
             "total_pemasukan": income,
-            "total_pengeluaran": expense, "laba_bersih": profit,
-            "margin_laba": round(profit / income * 100, 2) if income else 0,
+            "total_pengeluaran": expense, "arus_kas_bersih": cash_balance,
+            # Alias dipertahankan untuk klien lama; bukan laporan laba akuntansi.
+            "laba_bersih": cash_balance,
+            "bahan_terpakai": material_usage,
+            "nilai_return": return_value,
+            "nilai_persediaan_bahan": inventory_value,
+            "tanggal_persediaan": date.today(),
+            "margin_laba": round(cash_balance / income * 100, 2) if income else 0,
             "trend": trend,
             "transaksi": [{"id_transaksi": t.id_transaksi,
                            "id_kategori": t.id_kategori,
                            "tanggal_transaksi": t.tanggal_transaksi,
                            "kategori": k.nama_kategori, "jenis": k.jenis,
                            "nominal": float(t.nominal), "catatan": t.catatan,
-                           "sumber": t.sumber}
+                           "sumber": t.sumber,
+                           "mempengaruhi_kas": _is_cash_transaction(t, k)}
                           for t, k in rows]}
