@@ -176,6 +176,7 @@ class Resep(Base):
     id_resep = Column(Integer, primary_key=True)
     id_produk = Column(Integer, ForeignKey("produk.id_produk"), nullable=False)
     nama_resep = Column(String(100), nullable=False)
+    harga_jual_per_potong = Column(Numeric(15, 2), nullable=False, default=0)
     hasil_per_loyang = Column(Integer, nullable=False, default=33)
     satuan_hasil = Column(String(20), nullable=False, default="potong")
     status = Column(Enum("aktif", "nonaktif"), nullable=False, default="aktif")

@@ -25,7 +25,7 @@ from app.schemas import (BahanBakuCreate, BahanBakuUpdate, DataHarianBatchCreate
                          StockOpnameCreate, TransaksiKeuanganCreate,
                          PembelianBahanBakuCreate,
                          TransaksiKeuanganUpdate, PrediksiProductionCreate,
-                         ProduksiEksekusiCreate)
+                         ProduksiEksekusiCreate, ResepHargaUpdate)
 
 app = FastAPI(title="API Prediksi Suplai Puding", version="2.0.0")
 app.add_middleware(
@@ -70,19 +70,14 @@ def _finance_category_auto(db: Session, name: str, kind: str):
 
 
 def _pudding_price(db: Session) -> Decimal:
-    """Harga jual puding per potong dari master produk (PRD 7.1).
-
-    Harga diambil dari produk prediksi yang aktif. Bila kolomnya belum diisi
-    (0), dipakai PUDDING_PRICE supaya nilai transaksi lama tidak berubah.
-    """
-    product = (db.query(Produk)
-               .filter(Produk.metode_perencanaan == "prediksi",
-                       Produk.status == "aktif",
-                       Produk.harga_jual_per_potong > 0)
-               .order_by(Produk.id_produk).first())
-    if product is None:
+    """Harga resep prediksi aktif untuk penjualan harian mitra."""
+    recipe = (db.query(Resep).join(Produk, Produk.id_produk == Resep.id_produk)
+              .filter(Resep.status == "aktif", Produk.status == "aktif",
+                      Produk.metode_perencanaan == "prediksi")
+              .order_by(Resep.id_resep).first())
+    if recipe is None or recipe.harga_jual_per_potong <= 0:
         return PUDDING_PRICE
-    return Decimal(product.harga_jual_per_potong)
+    return Decimal(recipe.harga_jual_per_potong)
 
 
 def _sync_daily_finance(db: Session, tanggal: date):
@@ -337,11 +332,10 @@ def get_dashboard(db: Session = Depends(get_db)):
 
 @app.post("/data-harian")
 def save_daily(req: DataHarianCreate, db: Session = Depends(get_db)):
-    # Suplai dan return hanya boleh diinput satu kali per hari, yaitu untuk
-    # tanggal hari ini. Data yang sudah tersimpan tidak dapat diubah.
-    if req.tanggal != date.today():
+    # Suplai dan return dapat diinput untuk tanggal lampau atau hari ini. Data yang sudah tersimpan tidak dapat diubah.
+    if req.tanggal > date.today():
         raise HTTPException(
-            400, "Input data harian hanya untuk tanggal hari ini")
+            400, "Tanggal input data harian tidak boleh melebihi hari ini")
     partner = db.query(Mitra).filter(Mitra.id_mitra == req.id_mitra).first()
     if not partner:
         raise HTTPException(404, "Mitra tidak ditemukan")
@@ -390,7 +384,7 @@ def daily_draft(tanggal: date, db: Session = Depends(get_db)):
         DataHarian.tanggal < tanggal,
         DataHarian.mitra_tutup.is_(False),
     ).scalar()
-    if latest_date is not None and latest_date < tanggal:
+    if tanggal == date.today() and latest_date is not None and latest_date < tanggal:
         current = latest_date + timedelta(days=1)
         holiday_dates = []
         while current < tanggal:
@@ -476,12 +470,11 @@ def save_daily_batch(req: DataHarianBatchCreate,
             400,
             "Data belum mencakup seluruh mitra aktif. Muat ulang halaman input.",
         )
-    # Suplai dan return hanya boleh diinput satu kali per hari, yaitu untuk
-    # tanggal hari ini. Bila baris tanggal itu sudah ada, seluruh batch ditolak
+    # Suplai dan return dapat diinput untuk tanggal lampau atau hari ini. Bila baris tanggal itu sudah ada, seluruh batch ditolak
     # agar data yang sudah tersimpan tidak dapat ditimpa.
-    if req.tanggal != date.today():
+    if req.tanggal > date.today():
         raise HTTPException(
-            400, "Input data harian hanya untuk tanggal hari ini")
+            400, "Tanggal input data harian tidak boleh melebihi hari ini")
     existing_row = db.query(DataHarian.id_data).filter(
         DataHarian.tanggal == req.tanggal).first()
     if existing_row is not None:
@@ -610,6 +603,7 @@ def _prediction_recipe_plan(db: Session, predicted: int):
     trays = ceil(predicted / recipe.hasil_per_loyang) if predicted > 0 else 0
     materials = _recipe_materials(db, recipe.id_resep, trays)
     return {"id_resep": recipe.id_resep, "nama_resep": recipe.nama_resep,
+            "harga_jual_per_potong": recipe.harga_jual_per_potong,
             "hasil_per_loyang": recipe.hasil_per_loyang,
             "jumlah_loyang": trays,
             "hasil_produksi": trays * recipe.hasil_per_loyang,
@@ -1084,6 +1078,7 @@ def _recipe_json(db: Session, recipe: Resep):
             "nama_produk": product.nama_produk if product else "-",
             "metode_perencanaan": product.metode_perencanaan if product else "-",
             "nama_resep": recipe.nama_resep,
+            "harga_jual_per_potong": recipe.harga_jual_per_potong,
             "hasil_per_loyang": recipe.hasil_per_loyang,
             "satuan_hasil": recipe.satuan_hasil, "status": recipe.status,
             "bahan": [{"id_resep_bahan": detail.id_resep_bahan,
@@ -1117,7 +1112,25 @@ def get_products(metode: str = "semua", db: Session = Depends(get_db)):
                       "nama_produk": row.nama_produk,
                       "metode_perencanaan": row.metode_perencanaan,
                       "disuplai_ke_mitra": bool(row.disuplai_ke_mitra),
+                      "harga_jual_per_potong": row.harga_jual_per_potong,
                       "status": row.status} for row in rows]}
+
+
+@app.put("/resep/{id_resep}/harga")
+def update_recipe_price(id_resep: int, req: ResepHargaUpdate,
+                        db: Session = Depends(get_db)):
+    try:
+        recipe = db.query(Resep).filter(Resep.id_resep == id_resep).first()
+        if recipe is None:
+            raise HTTPException(404, "Resep tidak ditemukan")
+        recipe.harga_jual_per_potong = req.harga_jual_per_potong
+        db.commit()
+        return {"message": "Harga jual berhasil disimpan", "data": {
+            "id_resep": recipe.id_resep,
+            "harga_jual_per_potong": recipe.harga_jual_per_potong}}
+    except Exception:
+        db.rollback()
+        raise
 
 
 @app.post("/resep")
