@@ -1,5 +1,6 @@
 from datetime import date
 from decimal import Decimal
+from uuid import UUID
 from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
@@ -119,17 +120,21 @@ class ProduksiCreate(BaseModel):
     id_prediksi: Optional[int] = None
 
 
-class PrediksiProductionCreate(BaseModel):
-    tanggal_produksi: date
-
-
 class ProduksiEksekusiCreate(BaseModel):
+    id_rencana: int = Field(gt=0)
+    tanggal_target: date
+    id_permintaan: UUID
     prediksi_kebutuhan: int = Field(gt=0)
     stok_manual_dipakai: Optional[int] = Field(default=None, ge=0)
 
 
+class PrediksiProductionCreate(ProduksiEksekusiCreate):
+    tanggal_produksi: date
+
+
 class ResepCreate(BaseModel):
-    id_produk: int
+    id_produk: Optional[int] = None
+    metode_perencanaan: Optional[Literal["prediksi", "manual"]] = None
     nama_resep: str = Field(min_length=2, max_length=100)
     hasil_per_loyang: int = Field(ge=1)
     satuan_hasil: str = Field(min_length=1, max_length=20)

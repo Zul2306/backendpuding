@@ -1,18 +1,22 @@
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+import hashlib
+import json
 from math import ceil
 from pathlib import Path
 
 import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import extract, func
+from fastapi.encoders import jsonable_encoder
+from sqlalchemy import extract, func, case, and_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.release import API_VERSION, release_readiness
 from app.models import (BahanBaku, DataHarian, KategoriKeuangan, Mitra,
-                        LogStokRusak, ModelMitra, MutasiStok, PrediksiHarian,
+                        EksekusiPrediksi, LogStokRusak, ModelMitra, MutasiStok, PrediksiHarian,
                         Produk, Produksi, ProduksiDetail, Resep, ResepBahan,
                         StockOpname, StokBatch,
                         StockOpnameDetail, TransaksiKeuangan)
@@ -27,7 +31,7 @@ from app.schemas import (BahanBakuCreate, BahanBakuUpdate, DataHarianBatchCreate
                          TransaksiKeuanganUpdate, PrediksiProductionCreate,
                          ProduksiEksekusiCreate, ResepHargaUpdate)
 
-app = FastAPI(title="API Prediksi Suplai Puding", version="2.0.0")
+app = FastAPI(title="API Prediksi Suplai Puding", version=API_VERSION)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -77,35 +81,45 @@ def _finance_category_auto(db: Session, name: str, kind: str):
 
 def _pudding_price(db: Session) -> Decimal:
     """Harga resep prediksi aktif untuk penjualan harian mitra."""
-    recipe = (db.query(Resep).join(Produk, Produk.id_produk == Resep.id_produk)
-              .filter(Resep.status == "aktif", Produk.status == "aktif",
-                      Produk.metode_perencanaan == "prediksi")
-              .order_by(Resep.id_resep).first())
+    recipe = _prediction_recipe(db)
     if recipe is None or recipe.harga_jual_per_potong <= 0:
         return PUDDING_PRICE
     return Decimal(recipe.harga_jual_per_potong)
 
 
-def _sync_daily_finance(db: Session, tanggal: date):
+def _sync_daily_finance(db: Session, tanggal: date, new_rows=None):
     """Simpan total penjualan dan return seluruh mitra untuk satu tanggal."""
-    totals = db.query(
-        func.coalesce(func.sum(DataHarian.jumlah_terjual), 0),
-        func.coalesce(func.sum(DataHarian.jumlah_return), 0),
-    ).filter(DataHarian.tanggal == tanggal).one()
-    sold, returned = (int(totals[0]), int(totals[1]))
-    price = _pudding_price(db)
+    # Session memakai autoflush=False; input baru harus ikut agregasi.
+    db.flush()
+    daily_rows = db.query(DataHarian).filter(DataHarian.tanggal == tanggal).all()
+    historical_unknown = any(row.harga_jual_per_potong is None and
+           ((row.jumlah_terjual or 0) > 0 or (row.jumlah_return or 0) > 0)
+           for row in daily_rows)
+    if historical_unknown and new_rows is None:
+        raise HTTPException(409, "Harga historis tanggal ini belum tercatat. Transaksi lama tidak dapat dihitung ulang.")
+    # Untuk melengkapi data lama, pertahankan nominal historis dan tambahkan
+    # hanya nilai input baru; jangan menebak harga baris lama.
+    if historical_unknown:
+        daily_rows = new_rows
+    sales = sum((Decimal(row.jumlah_terjual or 0) * Decimal(row.harga_jual_per_potong or 0)
+                 for row in daily_rows), Decimal("0"))
+    returns = sum((Decimal(row.jumlah_return or 0) * Decimal(row.harga_jual_per_potong or 0)
+                   for row in daily_rows), Decimal("0"))
     entries = [
-        ("Penjualan puding", "pemasukan", sold * price,
-         AUTOMATIC_SALES_NOTE),
-        ("Return puding", "pengeluaran", returned * price,
-         AUTOMATIC_RETURN_NOTE),
+        ("Penjualan puding", "pemasukan", sales, AUTOMATIC_SALES_NOTE),
+        ("Return puding", "pengeluaran", returns, AUTOMATIC_RETURN_NOTE),
     ]
     for name, kind, nominal, note in entries:
         category = _finance_category(db, name, kind)
         transaction = (db.query(TransaksiKeuangan).filter(
             TransaksiKeuangan.id_kategori == category.id_kategori,
             TransaksiKeuangan.tanggal_transaksi == tanggal,
-            TransaksiKeuangan.referensi_tipe == "data_harian").first())
+            TransaksiKeuangan.referensi_tipe == "data_harian",
+            TransaksiKeuangan.sumber == "otomatis").first())
+        if historical_unknown:
+            if nominal <= 0:
+                continue
+            nominal += Decimal(transaction.nominal) if transaction is not None else Decimal('0')
         if nominal <= 0:
             if transaction is not None:
                 db.delete(transaction)
@@ -175,6 +189,15 @@ def _stock_json(bahan: BahanBaku, saldo):
 @app.get("/health")
 def health():
     return {"status": "ok", "message": "API berjalan"}
+
+
+@app.get("/release/readiness")
+def get_release_readiness(db: Session = Depends(get_db)):
+    try:
+        connection = db.connection()
+    except Exception:
+        return release_readiness(app.routes, None)
+    return release_readiness(app.routes, connection)
 
 
 @app.get("/mitra")
@@ -300,6 +323,18 @@ def get_dashboard(db: Session = Depends(get_db)):
             for prediction, partner in prediction_rows
         ]
 
+    plan_summary = None
+    if latest_prediction_target:
+        plan_rows = db.query(PrediksiHarian).filter(
+            PrediksiHarian.tanggal_target == latest_prediction_target,
+            PrediksiHarian.is_test.is_(False),
+            PrediksiHarian.status_prediksi != "dibatalkan").all()
+        produced_count = sum(row.status_prediksi == "diproduksi" for row in plan_rows)
+        plan_summary = {"tanggal_target": latest_prediction_target,
+                        "status": "Diproduksi" if plan_rows and produced_count == len(plan_rows)
+                            else "Prediksi Dikonfirmasi",
+                        "jumlah_mitra": len(plan_rows), "jumlah_diproduksi": produced_count}
+
     finance_rows = (
         db.query(TransaksiKeuangan, KategoriKeuangan)
         .join(KategoriKeuangan)
@@ -316,6 +351,7 @@ def get_dashboard(db: Session = Depends(get_db)):
         "total_suplai": int(supply),
         "total_bahan": len(stock),
         "stok_menipis": sum(x["status_stok"] != "Aman" for x in stock),
+        "rencana_prediksi": plan_summary,
         "status_input": {
             "tanggal": today,
             "total_mitra": int(mitra_count),
@@ -329,6 +365,7 @@ def get_dashboard(db: Session = Depends(get_db)):
             "data": top_predictions,
         },
         "keuangan_hari_ini": {
+            "tanggal": today,
             "pemasukan": income,
             "pengeluaran": expense,
             "arus_kas_bersih": income - expense,
@@ -365,6 +402,7 @@ def save_daily(req: DataHarianCreate, db: Session = Depends(get_db)):
                      mitra_tutup=req.mitra_tutup)
     db.add(row)
     try:
+        row.harga_jual_per_potong = _pudding_price(db)
         # Total penjualan dan return tanggal ini harus ikut diperbarui ketika
         # data harian mitra diubah, bukan hanya saat baris pertama dibuat.
         _sync_daily_finance(db, req.tanggal)
@@ -379,6 +417,7 @@ def save_daily(req: DataHarianCreate, db: Session = Depends(get_db)):
         "jumlah_suplai": row.jumlah_suplai,
         "jumlah_return": row.jumlah_return,
         "jumlah_terjual": row.jumlah_terjual,
+        "harga_jual_per_potong": row.harga_jual_per_potong,
         "mitra_tutup": row.mitra_tutup}}
 
 
@@ -391,26 +430,12 @@ def daily_draft(tanggal: date, db: Session = Depends(get_db)):
         DataHarian.tanggal < tanggal,
         DataHarian.mitra_tutup.is_(False),
     ).scalar()
-    if tanggal == date.today() and latest_date is not None and latest_date < tanggal:
-        current = latest_date + timedelta(days=1)
-        holiday_dates = []
-        while current < tanggal:
-            if not db.query(DataHarian.id_data).filter(
-                    DataHarian.tanggal == current).first():
-                holiday_dates.append(current)
-            current += timedelta(days=1)
-        if holiday_dates:
-            for holiday_date in holiday_dates:
-                for partner in partners:
-                    db.add(DataHarian(
-                        id_mitra=partner.id_mitra,
-                        tanggal=holiday_date,
-                        jumlah_suplai=0,
-                        jumlah_return=0,
-                        jumlah_terjual=0,
-                        mitra_tutup=True,
-                    ))
-            db.commit()
+    # Membaca draft tidak boleh menyimpan libur atau mengunci tanggal.
+    yesterday = date.today() - timedelta(days=1)
+    missing_date = None
+    if tanggal == date.today() and partners and not db.query(DataHarian.id_data).filter(
+            DataHarian.tanggal == yesterday).first():
+        missing_date = yesterday
     existing = {
         row.id_mitra: row for row in db.query(DataHarian).filter(
             DataHarian.tanggal == tanggal).all()
@@ -431,7 +456,8 @@ def daily_draft(tanggal: date, db: Session = Depends(get_db)):
             row.id_mitra: row for row in db.query(DataHarian).filter(
                 DataHarian.tanggal == latest_date).all()
         }
-    return {"tanggal": tanggal, "jumlah_mitra": len(partners), "data": [
+    return {"tanggal": tanggal, "tanggal_belum_diinput": missing_date,
+            "jumlah_mitra": len(partners), "data": [
         {"id_mitra": partner.id_mitra,
          "nama_mitra": partner.nama_mitra,
          "jumlah_suplai": existing[partner.id_mitra].jumlah_suplai
@@ -469,24 +495,16 @@ def save_daily_batch(req: DataHarianBatchCreate,
     partner_ids = {partner.id_mitra for partner in partners}
     submitted_ids = set(ids)
     unknown = submitted_ids - partner_ids
-    not_submitted = partner_ids - submitted_ids
     if unknown:
         raise HTTPException(400, f"Mitra aktif tidak ditemukan: {sorted(unknown)}")
-    if not_submitted:
-        raise HTTPException(
-            400,
-            "Data belum mencakup seluruh mitra aktif. Muat ulang halaman input.",
-        )
-    # Suplai dan return dapat diinput untuk tanggal lampau atau hari ini. Bila baris tanggal itu sudah ada, seluruh batch ditolak
-    # agar data yang sudah tersimpan tidak dapat ditimpa.
     if req.tanggal > date.today():
-        raise HTTPException(
-            400, "Tanggal input data harian tidak boleh melebihi hari ini")
-    existing_row = db.query(DataHarian.id_data).filter(
-        DataHarian.tanggal == req.tanggal).first()
-    if existing_row is not None:
-        raise HTTPException(
-            409, "Data harian tanggal ini sudah diinput dan tidak dapat diubah")
+        raise HTTPException(400, "Tanggal input data harian tidak boleh melebihi hari ini")
+    existing_ids = {row.id_mitra for row in db.query(DataHarian).filter(
+        DataHarian.tanggal == req.tanggal).all()}
+    if submitted_ids & existing_ids:
+        raise HTTPException(409, "Data mitra yang sudah tersimpan tidak dapat diubah. Muat ulang halaman input.")
+    if partner_ids - existing_ids - submitted_ids:
+        raise HTTPException(400, "Data belum mencakup seluruh mitra yang belum tersimpan. Muat ulang halaman input.")
 
     for item in req.items:
         supply = 0 if item.mitra_tutup else item.jumlah_suplai
@@ -499,22 +517,20 @@ def save_daily_batch(req: DataHarianBatchCreate,
             )
 
     try:
+        price = _pudding_price(db)
+        new_rows = []
         for item in req.items:
             supply = 0 if item.mitra_tutup else item.jumlah_suplai
             returned = 0 if item.mitra_tutup else item.jumlah_return
-            row = db.query(DataHarian).filter(
-                DataHarian.id_mitra == item.id_mitra,
-                DataHarian.tanggal == req.tanggal,
-            ).first()
-            if row is None:
-                row = DataHarian(id_mitra=item.id_mitra,
-                                  tanggal=req.tanggal)
-                db.add(row)
+            row = DataHarian(id_mitra=item.id_mitra, tanggal=req.tanggal)
+            db.add(row)
+            new_rows.append(row)
             row.jumlah_suplai = supply
             row.jumlah_return = returned
             row.jumlah_terjual = supply - returned
+            row.harga_jual_per_potong = price
             row.mitra_tutup = item.mitra_tutup
-        _sync_daily_finance(db, req.tanggal)
+        _sync_daily_finance(db, req.tanggal, new_rows=new_rows)
         db.commit()
     except Exception:
         db.rollback()
@@ -538,6 +554,7 @@ def daily_by_partner(id_mitra: int, db: Session = Depends(get_db)):
          "jumlah_suplai": x.jumlah_suplai,
          "jumlah_return": x.jumlah_return,
          "jumlah_terjual": x.jumlah_terjual,
+         "harga_jual_per_potong": x.harga_jual_per_potong,
          "mitra_tutup": bool(x.mitra_tutup)} for x in rows]}
 
 
@@ -567,10 +584,12 @@ def daily_history(
 
 
 def _prediction_recipe(db: Session):
-    return (db.query(Resep).join(Produk, Produk.id_produk == Resep.id_produk)
-            .filter(Resep.status == "aktif",
-                    Produk.metode_perencanaan == "prediksi",
-                    Produk.status == "aktif").first())
+    recipes = (db.query(Resep)
+               .filter(Resep.status == "aktif", Resep.metode_perencanaan == "prediksi")
+               .order_by(Resep.id_resep).all())
+    if len(recipes) > 1:
+        raise HTTPException(409, "Hanya satu jenis puding prediksi aktif yang didukung saat ini")
+    return recipes[0] if recipes else None
 
 
 def _tray_capacity(recipe) -> int:
@@ -655,6 +674,10 @@ def _prediction_total_plan(db: Session):
     plan = _prediction_recipe_plan(db, total)
     if plan is None:
         raise HTTPException(404, "Resep prediksi aktif belum tersedia")
+    plan["id_rencana"] = db.query(func.min(PrediksiHarian.id_prediksi)).filter(
+        PrediksiHarian.tanggal_target == target,
+        PrediksiHarian.is_test.is_(False),
+        PrediksiHarian.status_prediksi.in_(("disetujui", "diproduksi"))).scalar()
     plan["tanggal_target"] = target
     plan["jumlah_prediksi"] = int(total)
     plan["stok_cukup"] = all(item["cukup"] for item in plan["bahan"])
@@ -682,11 +705,15 @@ def preview_prediction_production(
 
 def _batch_production_plan(db: Session, prediksi_kebutuhan: int,
                            stok_manual_dipakai: int | None = None):
+    recipe = _prediction_recipe(db)
+    if recipe is None:
+        raise HTTPException(404, "Resep prediksi aktif belum tersedia")
     now = datetime.now()
     batches = (db.query(StokBatch)
-               .filter(StokBatch.jumlah_sisa > 0,
+               .filter(StokBatch.id_resep == recipe.id_resep,
+                       StokBatch.jumlah_sisa > 0,
                        StokBatch.tanggal_kadaluarsa > now)
-               .order_by(StokBatch.created_at.asc())
+               .order_by(StokBatch.created_at.asc(), StokBatch.id_batch.asc())
                .all())
     total_stok_sistem = sum(batch.jumlah_sisa for batch in batches)
     stok_manual = (total_stok_sistem if stok_manual_dipakai is None
@@ -694,10 +721,11 @@ def _batch_production_plan(db: Session, prediksi_kebutuhan: int,
     stok_rusak = max(0, total_stok_sistem - stok_manual)
     stok_layak = stok_manual
     kekurangan = max(0, prediksi_kebutuhan - stok_layak)
-    kapasitas_per_loyang = _tray_capacity(_prediction_recipe(db))
+    kapasitas_per_loyang = _tray_capacity(recipe)
     jumlah_loyang = ceil(kekurangan / kapasitas_per_loyang)
     sisa_stok_baru = (jumlah_loyang * kapasitas_per_loyang) - kekurangan
     return {
+        "id_resep": recipe.id_resep, "nama_resep": recipe.nama_resep,
         "prediksi_kebutuhan": prediksi_kebutuhan,
         "total_stok_sistem": total_stok_sistem,
         "stok_manual_dipakai": stok_manual,
@@ -792,10 +820,22 @@ def preview_all_predictions(db: Session = Depends(get_db)):
             "data": previews, "gagal": failed}
 
 
+def _lock_prediction_confirmation(db: Session, target: date):
+    rows = db.query(PrediksiHarian).filter(
+        PrediksiHarian.tanggal_target == target,
+        PrediksiHarian.is_test.is_(False)).order_by(
+            PrediksiHarian.id_prediksi).with_for_update().populate_existing().all()
+    if any(row.status_prediksi == "diproduksi" for row in rows) or db.query(
+            EksekusiPrediksi).filter(EksekusiPrediksi.tanggal_target == target).first():
+        db.rollback()
+        raise HTTPException(409, "Rencana tanggal ini sudah diproduksi dan tidak dapat diubah")
+
+
 @app.post("/prediksi/konfirmasi")
 def confirm_prediction(req: PrediksiConfirm, db: Session = Depends(get_db)):
     partner, model, result = _calculate_prediction(req.id_mitra, db)
     target = result["tanggal_target"]
+    _lock_prediction_confirmation(db, target)
     row = (db.query(PrediksiHarian).filter(
         PrediksiHarian.id_mitra == req.id_mitra,
         PrediksiHarian.tanggal_target == target,
@@ -852,6 +892,7 @@ def confirm_all_predictions(req: PrediksiBatchConfirm,
     for item in req.items:
         partner, model, result = _calculate_prediction(item.id_mitra, db)
         target = result["tanggal_target"]
+        _lock_prediction_confirmation(db, target)
         existing = (db.query(PrediksiHarian).filter(
             PrediksiHarian.id_mitra == item.id_mitra,
             PrediksiHarian.tanggal_target == target,
@@ -1083,7 +1124,7 @@ def _recipe_json(db: Session, recipe: Resep):
             .order_by(BahanBaku.nama_bahan).all())
     return {"id_resep": recipe.id_resep, "id_produk": recipe.id_produk,
             "nama_produk": product.nama_produk if product else "-",
-            "metode_perencanaan": product.metode_perencanaan if product else "-",
+            "metode_perencanaan": recipe.metode_perencanaan,
             "nama_resep": recipe.nama_resep,
             "harga_jual_per_potong": recipe.harga_jual_per_potong,
             "hasil_per_loyang": recipe.hasil_per_loyang,
@@ -1099,12 +1140,15 @@ def _recipe_json(db: Session, recipe: Resep):
 
 @app.get("/resep/manage")
 def manage_recipes(pencarian: str = "", status: str = "semua",
+                   metode: str = "semua",
                    db: Session = Depends(get_db)):
     query = db.query(Resep)
     if pencarian.strip():
         query = query.filter(Resep.nama_resep.like(f"%{pencarian.strip()}%"))
     if status in ("aktif", "nonaktif"):
         query = query.filter(Resep.status == status)
+    if metode in ("manual", "prediksi"):
+        query = query.filter(Resep.metode_perencanaan == metode)
     rows = query.order_by(Resep.nama_resep).all()
     return {"data": [_recipe_json(db, row) for row in rows]}
 
@@ -1140,33 +1184,67 @@ def update_recipe_price(id_resep: int, req: ResepHargaUpdate,
         raise
 
 
+def _recipe_settings(db: Session, req, current=None):
+    # id_produk dipertahankan untuk kompatibilitas histori, bukan pilihan jenis.
+    method = req.metode_perencanaan
+    product_id = req.id_produk if req.id_produk is not None else (
+        current.id_produk if current is not None else None)
+    product = db.query(Produk).filter(Produk.id_produk == product_id).first() if product_id else None
+    if product_id and product is None:
+        raise HTTPException(404, "Produk tidak ditemukan")
+    if method is None:
+        method = current.metode_perencanaan if current is not None else (
+            product.metode_perencanaan if product else "manual")
+    if product is None:
+        product = (db.query(Produk).filter(Produk.status == "aktif",
+                   Produk.metode_perencanaan == method).order_by(Produk.id_produk).first())
+        if product is None:
+            raise HTTPException(400, "Master perencanaan belum tersedia")
+        product_id = product.id_produk
+    if method == "prediksi" and req.status == "aktif":
+        # Serialize perubahan metode antar resep pada satu transaksi.
+        db.query(Produk).order_by(Produk.id_produk).with_for_update().all()
+        query = db.query(Resep).filter(Resep.status == "aktif",
+                                     Resep.metode_perencanaan == "prediksi")
+        if current is not None:
+            query = query.filter(Resep.id_resep != current.id_resep)
+        if query.first():
+            raise HTTPException(409, "Sudah ada jenis puding prediksi aktif. Nonaktifkan atau ubah metodenya dahulu.")
+    values = req.model_dump()
+    values["id_produk"] = product_id
+    values["metode_perencanaan"] = method
+    return {key: value.strip() if isinstance(value, str) else value
+            for key, value in values.items()}
+
+
 @app.post("/resep")
 def create_recipe(req: ResepCreate, db: Session = Depends(get_db)):
-    if not db.query(Produk).filter(Produk.id_produk == req.id_produk).first():
-        raise HTTPException(404, "Produk tidak ditemukan")
-    row = Resep(**req.model_dump())
-    row.nama_resep = row.nama_resep.strip()
-    row.satuan_hasil = row.satuan_hasil.strip()
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return {"status": "berhasil", "message": "Resep berhasil ditambahkan",
-            "data": _recipe_json(db, row)}
+    try:
+        row = Resep(**_recipe_settings(db, req))
+        db.add(row)
+        db.commit()
+        return {"status": "berhasil", "message": "Resep berhasil ditambahkan",
+                "data": _recipe_json(db, row)}
+    except Exception:
+        db.rollback()
+        raise
 
 
 @app.put("/resep/{id_resep}")
 def update_recipe(id_resep: int, req: ResepUpdate,
                   db: Session = Depends(get_db)):
-    row = db.query(Resep).filter(Resep.id_resep == id_resep).first()
-    if not row:
-        raise HTTPException(404, "Resep tidak ditemukan")
-    if not db.query(Produk).filter(Produk.id_produk == req.id_produk).first():
-        raise HTTPException(404, "Produk tidak ditemukan")
-    for key, value in req.model_dump().items():
-        setattr(row, key, value.strip() if isinstance(value, str) else value)
-    db.commit()
-    return {"status": "berhasil", "message": "Resep berhasil diperbarui",
-            "data": _recipe_json(db, row)}
+    try:
+        row = db.query(Resep).filter(Resep.id_resep == id_resep).first()
+        if not row:
+            raise HTTPException(404, "Resep tidak ditemukan")
+        for key, value in _recipe_settings(db, req, row).items():
+            setattr(row, key, value)
+        db.commit()
+        return {"status": "berhasil", "message": "Resep berhasil diperbarui",
+                "data": _recipe_json(db, row)}
+    except Exception:
+        db.rollback()
+        raise
 
 
 @app.delete("/resep/{id_resep}")
@@ -1234,9 +1312,7 @@ def deactivate_recipe_material(id_resep_bahan: int,
 
 @app.get("/resep/aktif")
 def get_active_recipe(db: Session = Depends(get_db)):
-    recipe = (db.query(Resep).join(Produk, Produk.id_produk == Resep.id_produk)
-              .filter(Resep.status == "aktif",
-                      Produk.metode_perencanaan == "prediksi").first())
+    recipe = _prediction_recipe(db)
     if not recipe:
         raise HTTPException(404, "Resep aktif tidak ditemukan")
     stock = {x.id_bahan: (x, float(s or 0)) for x, s in _stock_query(db).all()}
@@ -1256,129 +1332,166 @@ def get_active_recipe(db: Session = Depends(get_db)):
                       for detail, material in details]}}
 
 
-def _manual_production_plan(db: Session, product_id: int, trays: int):
-    product = db.query(Produk).filter(
-        Produk.id_produk == product_id, Produk.status == "aktif",
-        Produk.metode_perencanaan == "manual").first()
-    if not product:
-        raise HTTPException(404, "Produk manual tidak ditemukan")
-    recipe = db.query(Resep).filter(
-        Resep.id_produk == product_id, Resep.status == "aktif").first()
-    if not recipe:
-        raise HTTPException(404, "Resep aktif produk belum tersedia")
-    stock = {x.id_bahan: (x, float(s or 0)) for x, s in _stock_query(db).all()}
-    details = db.query(ResepBahan).filter(
-        ResepBahan.id_resep == recipe.id_resep,
-        ResepBahan.status == "aktif").all()
-    materials = []
-    for detail in details:
-        material, available = stock.get(detail.id_bahan, (None, 0))
-        needed = float(detail.kebutuhan_per_loyang) * trays
-        materials.append({"id_bahan": detail.id_bahan,
-            "nama_bahan": material.nama_bahan if material else "Bahan tidak aktif",
-            "kebutuhan": needed, "stok_tersedia": available,
-            "satuan": material.satuan_resep if material else "-",
-            "cukup": available >= needed,
-            "kekurangan": max(needed - available, 0)})
-    return {"id_produk": product.id_produk, "nama_produk": product.nama_produk,
-            "id_resep": recipe.id_resep, "nama_resep": recipe.nama_resep,
+def _manual_production_plan(db: Session, recipe_id: int, trays: int):
+    recipe = db.query(Resep).filter(Resep.id_resep == recipe_id,
+        Resep.status == "aktif", Resep.metode_perencanaan == "manual").first()
+    if recipe is None:
+        raise HTTPException(404, "Jenis puding manual aktif tidak ditemukan")
+    materials = _recipe_materials(db, recipe.id_resep, trays)
+    now = datetime.now()
+    available = db.query(func.coalesce(func.sum(StokBatch.jumlah_sisa), 0)).filter(
+        StokBatch.id_resep == recipe.id_resep, StokBatch.jumlah_sisa > 0,
+        StokBatch.tanggal_kadaluarsa > now).scalar()
+    return {"id_resep": recipe.id_resep, "nama_resep": recipe.nama_resep,
+            "metode_perencanaan": recipe.metode_perencanaan,
             "jumlah_loyang": trays,
             "hasil_produksi": trays * recipe.hasil_per_loyang,
             "satuan_hasil": recipe.satuan_hasil,
+            "stok_puding": int(available or 0),
             "stok_cukup": bool(materials) and all(x["cukup"] for x in materials),
             "bahan": materials}
 
 
 @app.get("/produksi/manual/preview")
-def preview_manual_production(id_produk: int, jumlah_loyang: int = Query(ge=1),
+def preview_manual_production(jumlah_loyang: int = Query(ge=1),
+                              id_resep: int | None = None,
+                              id_produk: int | None = None,
                               db: Session = Depends(get_db)):
-    return {"data": _manual_production_plan(db, id_produk, jumlah_loyang)}
+    if id_resep is None and id_produk is not None:
+        recipes = db.query(Resep).filter(Resep.id_produk == id_produk,
+            Resep.status == "aktif", Resep.metode_perencanaan == "manual").all()
+        if len(recipes) != 1:
+            raise HTTPException(400, "Pilih jenis puding menggunakan id_resep, bukan id_produk")
+        id_resep = recipes[0].id_resep
+    if id_resep is None:
+        raise HTTPException(400, "Jenis puding wajib dipilih")
+    return {"data": _manual_production_plan(db, id_resep, jumlah_loyang)}
+
+
+@app.get("/stok-puding")
+def pudding_stock(db: Session = Depends(get_db)):
+    now = datetime.now()
+    batches = (db.query(StokBatch).filter(StokBatch.jumlah_sisa > 0)
+               .order_by(StokBatch.created_at, StokBatch.id_batch).all())
+    recipes = {r.id_resep: r for r in db.query(Resep).all()}
+    grouped = {}
+    for batch in batches:
+        recipe = recipes.get(batch.id_resep)
+        row = grouped.setdefault(batch.id_resep, {
+            "id_resep": batch.id_resep,
+            "nama_resep": recipe.nama_resep if recipe else "Belum ditentukan",
+            "satuan_hasil": recipe.satuan_hasil if recipe else "potong",
+            "stok_tersedia": 0, "stok_kadaluarsa": 0, "batch": []})
+        expired = batch.tanggal_kadaluarsa <= now
+        row["stok_kadaluarsa" if expired else "stok_tersedia"] += batch.jumlah_sisa
+        row["batch"].append({"id_batch": batch.id_batch, "jumlah_sisa": batch.jumlah_sisa,
+                             "tanggal_kadaluarsa": batch.tanggal_kadaluarsa,
+                             "kadaluarsa": expired})
+    return {"data": list(grouped.values())}
 
 
 @app.post("/produksi")
 def create_production(req: ProduksiCreate, db: Session = Depends(get_db)):
-    recipe = db.query(Resep).filter(Resep.id_resep == req.id_resep,
-                                    Resep.status == "aktif").first()
-    if not recipe:
-        raise HTTPException(404, "Resep aktif tidak ditemukan")
-    details = db.query(ResepBahan).filter(
-        ResepBahan.id_resep == req.id_resep, ResepBahan.status == "aktif").all()
-    if not details:
-        raise HTTPException(400, "Bahan resep belum diisi")
-    stock = {x.id_bahan: (x, float(s or 0)) for x, s in _stock_query(db).all()}
-    shortages = []
-    for detail in details:
-        needed = float(detail.kebutuhan_per_loyang) * req.jumlah_loyang
-        available = stock.get(detail.id_bahan, (None, 0))[1]
-        if available < needed:
-            material = stock.get(detail.id_bahan, (None, 0))[0]
-            shortages.append(f"{material.nama_bahan if material else detail.id_bahan}: kurang {needed - available:g}")
-    if shortages:
-        raise HTTPException(400, "Stok tidak cukup: " + ", ".join(shortages))
-    production = Produksi(id_resep=req.id_resep,
-        sumber_produksi=req.sumber_produksi, jumlah_diminta=req.jumlah_diminta,
-        id_prediksi=req.id_prediksi,
-        tanggal_produksi=req.tanggal_produksi, jumlah_loyang=req.jumlah_loyang,
-        hasil_produksi=recipe.hasil_per_loyang * req.jumlah_loyang,
-        status="selesai", catatan=req.catatan)
-    db.add(production)
-    db.flush()
-    material_cost = Decimal("0")
-    for detail in details:
-        material, before = stock[detail.id_bahan]
-        used = float(detail.kebutuhan_per_loyang) * req.jumlah_loyang
-        material_cost += Decimal(str(used)) * Decimal(
-            material.harga_per_satuan_resep or 0)
-        db.add(ProduksiDetail(id_produksi=production.id_produksi,
-            id_bahan=detail.id_bahan, jumlah_pakai=used,
-            stok_sebelum=before, stok_sesudah=before-used))
-        db.add(MutasiStok(id_bahan=detail.id_bahan,
-            tanggal_mutasi=req.tanggal_produksi, jenis_mutasi="pemakaian_produksi",
-            jumlah_masuk=0, jumlah_keluar=used,
-            referensi_tipe="produksi", referensi_id=production.id_produksi,
-            catatan=f"Produksi {req.jumlah_loyang} loyang {recipe.nama_resep}"))
-    if material_cost > 0:
-        category = _finance_category(db, "Pemakaian bahan baku", "pengeluaran")
-        db.add(TransaksiKeuangan(
-            id_kategori=category.id_kategori,
-            tanggal_transaksi=req.tanggal_produksi,
-            nominal=material_cost,
-            catatan=AUTOMATIC_MATERIAL_NOTE,
-            sumber="otomatis",
-            referensi_tipe="produksi",
-            referensi_id=production.id_produksi,
-        ))
-    db.commit()
-    return {"status": "berhasil",
-            "message": f"Produksi {req.jumlah_loyang} loyang berhasil dicatat",
-            "data": {"id_produksi": production.id_produksi,
-                     "hasil_produksi": production.hasil_produksi,
-                     "satuan_hasil": recipe.satuan_hasil}}
+    if req.sumber_produksi == "prediksi":
+        raise HTTPException(400, "Produksi prediksi harus menggunakan ID rencana melalui /api/produksi/eksekusi")
+    try:
+        result = _record_production(req, db)
+        db.commit()
+        return result
+    except Exception:
+        db.rollback()
+        raise
+
+
+def _record_production(req: ProduksiCreate, db: Session):
+    try:
+        recipe = db.query(Resep).filter(Resep.id_resep == req.id_resep,
+                                        Resep.status == "aktif").first()
+        if not recipe:
+            raise HTTPException(404, "Resep aktif tidak ditemukan")
+        if recipe.metode_perencanaan != req.sumber_produksi:
+            raise HTTPException(400, "Metode produksi tidak sesuai jenis puding")
+        details = db.query(ResepBahan).filter(
+            ResepBahan.id_resep == req.id_resep, ResepBahan.status == "aktif").all()
+        if not details:
+            raise HTTPException(400, "Bahan resep belum diisi")
+        db.query(BahanBaku).filter(BahanBaku.id_bahan.in_(
+            [detail.id_bahan for detail in details])).order_by(BahanBaku.id_bahan).with_for_update().all()
+        stock = {x.id_bahan: (x, float(s or 0)) for x, s in _stock_query(db).all()}
+        shortages = []
+        for detail in details:
+            needed = float(detail.kebutuhan_per_loyang) * req.jumlah_loyang
+            available = stock.get(detail.id_bahan, (None, 0))[1]
+            if available < needed:
+                material = stock.get(detail.id_bahan, (None, 0))[0]
+                shortages.append(f"{material.nama_bahan if material else detail.id_bahan}: kurang {needed - available:g}")
+        if shortages:
+            raise HTTPException(400, "Stok tidak cukup: " + ", ".join(shortages))
+        production = Produksi(id_resep=req.id_resep,
+            sumber_produksi=req.sumber_produksi, jumlah_diminta=req.jumlah_diminta,
+            id_prediksi=req.id_prediksi,
+            tanggal_produksi=req.tanggal_produksi, jumlah_loyang=req.jumlah_loyang,
+            hasil_produksi=recipe.hasil_per_loyang * req.jumlah_loyang,
+            status="selesai", catatan=req.catatan)
+        db.add(production)
+        db.flush()
+        material_cost = Decimal("0")
+        for detail in details:
+            material, before = stock[detail.id_bahan]
+            used = float(detail.kebutuhan_per_loyang) * req.jumlah_loyang
+            material_cost += Decimal(str(used)) * Decimal(
+                material.harga_per_satuan_resep or 0)
+            db.add(ProduksiDetail(id_produksi=production.id_produksi,
+                id_bahan=detail.id_bahan, jumlah_pakai=used,
+                stok_sebelum=before, stok_sesudah=before-used))
+            db.add(MutasiStok(id_bahan=detail.id_bahan,
+                tanggal_mutasi=req.tanggal_produksi, jenis_mutasi="pemakaian_produksi",
+                jumlah_masuk=0, jumlah_keluar=used,
+                harga_satuan=material.harga_per_satuan_resep,
+                referensi_tipe="produksi", referensi_id=production.id_produksi,
+                catatan=f"Produksi {req.jumlah_loyang} loyang {recipe.nama_resep}"))
+        if material_cost > 0:
+            category = _finance_category(db, "Pemakaian bahan baku", "pengeluaran")
+            db.add(TransaksiKeuangan(
+                id_kategori=category.id_kategori,
+                tanggal_transaksi=req.tanggal_produksi,
+                nominal=material_cost,
+                catatan=AUTOMATIC_MATERIAL_NOTE,
+                sumber="otomatis",
+                referensi_tipe="produksi",
+                referensi_id=production.id_produksi,
+            ))
+        result_qty = production.hasil_produksi if req.sumber_produksi == "manual" else max(
+            0, production.hasil_produksi - (req.jumlah_diminta or production.hasil_produksi))
+        batch = None
+        if result_qty > 0:
+            batch = StokBatch(id_resep=recipe.id_resep, jumlah_awal=result_qty,
+                              jumlah_sisa=result_qty,
+                              tanggal_kadaluarsa=datetime.combine(req.tanggal_produksi, time.min) + timedelta(days=7))
+            db.add(batch)
+        db.flush()
+        return {"status": "berhasil",
+                "message": f"Produksi {req.jumlah_loyang} loyang berhasil dicatat",
+                "data": {"id_produksi": production.id_produksi,
+                         "hasil_produksi": production.hasil_produksi,
+                         "id_resep": recipe.id_resep, "nama_resep": recipe.nama_resep,
+                         "id_batch_baru": batch.id_batch if batch else None,
+                         "stok_puding_masuk": result_qty,
+                         "satuan_hasil": recipe.satuan_hasil}}
+
+
+    except Exception:
+        db.rollback()
+        raise
 
 
 @app.post("/prediksi/produksi")
 def create_prediction_production(req: PrediksiProductionCreate,
                                  db: Session = Depends(get_db)):
-    plan = _prediction_total_plan(db)
-    if not plan["stok_cukup"]:
-        raise HTTPException(400, "Stok bahan baku tidak mencukupi")
-    result = create_production(ProduksiCreate(
-        id_resep=plan["id_resep"],
-        tanggal_produksi=req.tanggal_produksi,
-        jumlah_loyang=plan["jumlah_loyang"],
-        jumlah_diminta=plan["jumlah_prediksi"],
-        sumber_produksi="prediksi",
-        catatan="Produksi otomatis dari total prediksi seluruh mitra",
-    ), db)
-    target = plan["tanggal_target"]
-    db.query(PrediksiHarian).filter(
-        PrediksiHarian.tanggal_target == target,
-        PrediksiHarian.status_prediksi == "disetujui",
-        PrediksiHarian.is_test.is_(False),
-    ).update({PrediksiHarian.status_prediksi: "diproduksi"},
-             synchronize_session=False)
-    db.commit()
-    return result
+    if req.tanggal_produksi != date.today():
+        raise HTTPException(400, "Tanggal produksi harus hari ini")
+    return execute_batch_production(ProduksiEksekusiCreate(
+        **req.model_dump(exclude={"tanggal_produksi"})), db)
 
 
 @app.post("/api/produksi/eksekusi")
@@ -1386,23 +1499,46 @@ def execute_batch_production(req: ProduksiEksekusiCreate,
                              db: Session = Depends(get_db)):
     """Eksekusi konsumsi stok batch FIFO dan produksi kekurangan."""
     try:
-        # PRD 6.1: kebutuhan produksi adalah total jumlah_disetujui pada satu
-        # tanggal target. Angka dari klien diselaraskan lebih dahulu supaya
-        # prediksi pada target lain tidak salah ditandai sudah diproduksi.
-        prediksi_target, total_disetujui = _approved_prediction_total(db)
-        if (prediksi_target is not None and
-                total_disetujui != req.prediksi_kebutuhan):
-            raise HTTPException(
-                409,
-                "Total prediksi yang disetujui sekarang "
-                f"{total_disetujui} produk, bukan {req.prediksi_kebutuhan}. "
-                "Muat ulang halaman prediksi.",
-            )
+        request_id = str(req.id_permintaan)
+        fingerprint = hashlib.sha256(json.dumps(
+            req.model_dump(mode="json", exclude={"id_permintaan"}),
+            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        # Kunci seluruh anggota rencana dengan urutan tetap sebelum membaca
+        # status atau mengubah stok; permintaan bersamaan menunggu transaksi ini.
+        predictions = db.query(PrediksiHarian).filter(
+            PrediksiHarian.tanggal_target == req.tanggal_target,
+            PrediksiHarian.is_test.is_(False)).order_by(
+                PrediksiHarian.id_prediksi).with_for_update().populate_existing().all()
+        previous = db.get(EksekusiPrediksi, request_id)
+        if previous is not None:
+            if previous.sidik_permintaan != fingerprint:
+                raise HTTPException(409, "Kode permintaan sudah digunakan untuk data berbeda")
+            result = previous.hasil
+            db.rollback()
+            return result
+        members = [row for row in predictions if row.status_prediksi != "dibatalkan"]
+        if not members or min(row.id_prediksi for row in members) != req.id_rencana:
+            raise HTTPException(409, "ID rencana dan tanggal target tidak sesuai. Muat ulang halaman prediksi.")
+        if any(row.status_prediksi != "disetujui" for row in members) or db.query(
+                EksekusiPrediksi).filter(EksekusiPrediksi.tanggal_target == req.tanggal_target).first():
+            raise HTTPException(409, "Rencana ini sudah diproduksi dan tidak dapat dijalankan ulang")
+        prediksi_target = req.tanggal_target
+        total_disetujui = sum(row.jumlah_disetujui or 0 for row in members)
+        if total_disetujui != req.prediksi_kebutuhan:
+            raise HTTPException(409, "Jumlah rencana berubah. Muat ulang halaman prediksi.")
+        execution = EksekusiPrediksi(id_permintaan=request_id, id_rencana=req.id_rencana,
+            tanggal_target=req.tanggal_target, sidik_permintaan=fingerprint, hasil={})
+        db.add(execution)
+        db.flush()
+        recipe = _prediction_recipe(db)
+        if recipe is None:
+            raise HTTPException(404, "Resep prediksi aktif belum tersedia")
         now = datetime.now()
         batches = (db.query(StokBatch)
-                   .filter(StokBatch.jumlah_sisa > 0,
+                   .filter(StokBatch.id_resep == recipe.id_resep,
+                           StokBatch.jumlah_sisa > 0,
                            StokBatch.tanggal_kadaluarsa > now)
-                   .order_by(StokBatch.created_at.asc())
+                   .order_by(StokBatch.created_at.asc(), StokBatch.id_batch.asc())
                    .with_for_update().all())
         total_stok_sistem = sum(batch.jumlah_sisa for batch in batches)
         stok_manual = (total_stok_sistem
@@ -1443,12 +1579,18 @@ def execute_batch_production(req: ProduksiEksekusiCreate,
         batch_baru = None
         if jumlah_loyang > 0:
             batch_baru = StokBatch(
+                id_resep=recipe.id_resep,
                 jumlah_awal=sisa_stok_baru,
                 jumlah_sisa=sisa_stok_baru,
                 tanggal_kadaluarsa=now + timedelta(days=7),
             )
             db.add(batch_baru)
 
+        if jumlah_loyang > 0:
+            material_ids = [row.id_bahan for row in db.query(ResepBahan).filter(
+                ResepBahan.id_resep == recipe.id_resep, ResepBahan.status == "aktif").all()]
+            db.query(BahanBaku).filter(BahanBaku.id_bahan.in_(material_ids)).order_by(
+                BahanBaku.id_bahan).with_for_update().all()
         # Catat produksi loyang baru: kurangi stok bahan baku sesuai resep dan
         # buat pengeluaran "Pemakaian bahan baku" di keuangan (PRD 7.2).
         materials = (_recipe_materials(db, recipe.id_resep, jumlah_loyang)
@@ -1472,6 +1614,7 @@ def execute_batch_production(req: ProduksiEksekusiCreate,
             production = Produksi(
                 id_resep=recipe.id_resep,
                 sumber_produksi="prediksi",
+                id_prediksi=req.id_rencana,
                 jumlah_diminta=req.prediksi_kebutuhan,
                 tanggal_produksi=date.today(),
                 jumlah_loyang=jumlah_loyang,
@@ -1523,17 +1666,14 @@ def execute_batch_production(req: ProduksiEksekusiCreate,
                .update({PrediksiHarian.status_prediksi: "diproduksi"},
                        synchronize_session=False))
 
-        db.commit()
-        if batch_baru is not None:
-            db.refresh(batch_baru)
-        if production is not None:
-            db.refresh(production)
-        if finance_row is not None:
-            db.refresh(finance_row)
-        return {
+        db.flush()
+        result = {
             "status": "berhasil",
             "message": "Eksekusi produksi berhasil",
             "data": {
+                "id_rencana": req.id_rencana, "tanggal_target": req.tanggal_target,
+                "id_permintaan": request_id,
+                "id_resep": recipe.id_resep, "nama_resep": recipe.nama_resep,
                 "prediksi_kebutuhan": req.prediksi_kebutuhan,
                 "total_stok_sistem": total_stok_sistem,
                 "stok_manual_dipakai": stok_manual,
@@ -1570,6 +1710,13 @@ def execute_batch_production(req: ProduksiEksekusiCreate,
                 },
             },
         }
+        encoded_result = jsonable_encoder(result)
+        execution.hasil = encoded_result
+        db.commit()
+        return encoded_result
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Permintaan atau rencana sudah diproses. Muat ulang halaman prediksi.")
     except Exception:
         db.rollback()
         raise
@@ -1620,23 +1767,43 @@ def _mutation_json(mutation: MutasiStok, material: BahanBaku):
     }
 
 
+def _pagination(page: int, limit: int, total: int):
+    if page < 1 or not 1 <= limit <= 100:
+        raise HTTPException(422, "Halaman minimal 1 dan jumlah per halaman harus 1 sampai 100")
+    pages = max(1, ceil(total / limit))
+    return {"page": page, "limit": limit, "total": total,
+            "total_pages": pages, "has_next": page < pages, "has_previous": page > 1}
+
+
 @app.get("/mutasi-stok/riwayat")
 def stock_mutation_history(
     tanggal_mulai: date | None = None,
     tanggal_selesai: date | None = None,
+    page: int = 1,
+    limit: int = 50,
     db: Session = Depends(get_db),
 ):
+    _pagination(page, limit, 0)
+    if tanggal_mulai and tanggal_selesai and tanggal_mulai > tanggal_selesai:
+        raise HTTPException(422, "Tanggal mulai tidak boleh setelah tanggal selesai")
     query = (db.query(MutasiStok, BahanBaku)
              .join(BahanBaku, BahanBaku.id_bahan == MutasiStok.id_bahan))
     if tanggal_mulai is not None:
         query = query.filter(MutasiStok.tanggal_mutasi >= tanggal_mulai)
     if tanggal_selesai is not None:
         query = query.filter(MutasiStok.tanggal_mutasi <
-                             datetime.combine(tanggal_selesai, time.max))
-    rows = query.order_by(MutasiStok.tanggal_mutasi.desc(),
-                          MutasiStok.id_mutasi.desc()).limit(500).all()
-    return {"data": [_mutation_json(mutation, material)
-                     for mutation, material in rows]}
+                             datetime.combine(tanggal_selesai + timedelta(days=1), time.min))
+    total = query.count()
+    # Ringkasan seluruh hasil filter, bukan hanya halaman yang tampil.
+    price = func.coalesce(func.nullif(MutasiStok.harga_satuan, 0), BahanBaku.harga_per_satuan_resep, 0)
+    totals = query.with_entities(
+        func.coalesce(func.sum(MutasiStok.jumlah_masuk * price), 0),
+        func.coalesce(func.sum(MutasiStok.jumlah_keluar * price), 0)).one()
+    rows = query.order_by(MutasiStok.tanggal_mutasi.desc(), MutasiStok.id_mutasi.desc()).offset(
+        (page - 1) * limit).limit(limit).all()
+    return {"data": [_mutation_json(mutation, material) for mutation, material in rows],
+            "pagination": _pagination(page, limit, total),
+            "summary": {"total": total, "nilai_masuk": float(totals[0]), "nilai_keluar": float(totals[1])}}
 
 
 @app.get("/stock-opname/{id_opname}")
@@ -1788,28 +1955,40 @@ def finance_categories(db: Session = Depends(get_db)):
 @app.get("/transaksi-keuangan")
 def list_finance(
     jenis: str | None = None,
-    limit: int = Query(default=100, ge=1, le=500),
+    limit: int = Query(default=100, ge=1, le=100),
+    page: int = 1,
+    tanggal: date | None = None,
+    exclude_material_usage: bool = False,
     db: Session = Depends(get_db),
 ):
-    """Riwayat transaksi keuangan (masuk dan keluar), terbaru lebih dahulu."""
-    query = (db.query(TransaksiKeuangan, KategoriKeuangan)
-             .join(KategoriKeuangan))
+    """Riwayat berhalaman; total kas dihitung dari seluruh hasil filter."""
+    _pagination(page, limit, 0)
+    query = (db.query(TransaksiKeuangan, KategoriKeuangan).join(KategoriKeuangan))
     if jenis in ("pemasukan", "pengeluaran"):
         query = query.filter(KategoriKeuangan.jenis == jenis)
+    if tanggal is not None:
+        query = query.filter(TransaksiKeuangan.tanggal_transaksi == tanggal)
+    if exclude_material_usage:
+        query = query.filter(KategoriKeuangan.nama_kategori != "Pemakaian bahan baku")
+    total = query.count()
+    noncash = and_(TransaksiKeuangan.sumber == "otomatis",
+                   KategoriKeuangan.nama_kategori.in_(("Pemakaian bahan baku", "Return puding")))
+    totals = query.with_entities(
+        func.coalesce(func.sum(case((and_(KategoriKeuangan.jenis == "pemasukan", ~noncash),
+                                    TransaksiKeuangan.nominal), else_=0)), 0),
+        func.coalesce(func.sum(case((and_(KategoriKeuangan.jenis == "pengeluaran", ~noncash),
+                                    TransaksiKeuangan.nominal), else_=0)), 0)).one()
     rows = query.order_by(TransaksiKeuangan.tanggal_transaksi.desc(),
-                          TransaksiKeuangan.id_transaksi.desc()).limit(
-                              limit).all()
-    masuk = sum(float(t.nominal) for t, k in rows if k.jenis == "pemasukan" and _is_cash_transaction(t, k))
-    keluar = sum(float(t.nominal) for t, k in rows if k.jenis == "pengeluaran" and _is_cash_transaction(t, k))
-    return {"jumlah": len(rows), "total_masuk": masuk, "total_keluar": keluar,
+                          TransaksiKeuangan.id_transaksi.desc()).offset((page - 1) * limit).limit(limit).all()
+    return {"jumlah": len(rows), "total_masuk": float(totals[0]), "total_keluar": float(totals[1]),
+            "pagination": _pagination(page, limit, total),
             "data": [{"id_transaksi": t.id_transaksi,
                       "id_kategori": t.id_kategori,
                       "tanggal_transaksi": t.tanggal_transaksi,
                       "kategori": k.nama_kategori, "jenis": k.jenis,
                       "nominal": float(t.nominal), "catatan": t.catatan,
                       "sumber": t.sumber,
-                      "mempengaruhi_kas": _is_cash_transaction(t, k)}
-                     for t, k in rows]}
+                      "mempengaruhi_kas": _is_cash_transaction(t, k)} for t, k in rows]}
 
 
 @app.post("/transaksi-keuangan")
@@ -1867,9 +2046,6 @@ def get_finance(tanggal: date = Query(default_factory=date.today),
         start, end = end, start
     if (end - start).days > 366:
         raise HTTPException(400, "Rentang tanggal maksimal 1 tahun")
-    if tanggal_mulai is None and tanggal_selesai is None:
-        _sync_daily_finance(db, tanggal)
-        db.commit()
     rows = (db.query(TransaksiKeuangan, KategoriKeuangan)
             .join(KategoriKeuangan)
             .filter(TransaksiKeuangan.tanggal_transaksi >= start,

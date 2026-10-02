@@ -1,0 +1,238 @@
+{
+  "api_version": "2.2.0",
+  "contract_version": 1,
+  "schema_revision": "20261002_prediction_execution",
+  "required_endpoints": [
+    {
+      "method": "GET",
+      "path": "/mitra"
+    },
+    {
+      "method": "GET",
+      "path": "/mitra/manage"
+    },
+    {
+      "method": "POST",
+      "path": "/mitra"
+    },
+    {
+      "method": "PUT",
+      "path": "/mitra/{id_mitra}"
+    },
+    {
+      "method": "DELETE",
+      "path": "/mitra/{id_mitra}"
+    },
+    {
+      "method": "GET",
+      "path": "/dashboard"
+    },
+    {
+      "method": "POST",
+      "path": "/data-harian"
+    },
+    {
+      "method": "GET",
+      "path": "/data-harian/draft"
+    },
+    {
+      "method": "POST",
+      "path": "/data-harian/batch"
+    },
+    {
+      "method": "GET",
+      "path": "/data-harian/{id_mitra}"
+    },
+    {
+      "method": "GET",
+      "path": "/riwayat-harian"
+    },
+    {
+      "method": "GET",
+      "path": "/prediksi/produksi/preview"
+    },
+    {
+      "method": "POST",
+      "path": "/prediksi/{id_mitra}"
+    },
+    {
+      "method": "POST",
+      "path": "/prediksi/preview/{id_mitra}"
+    },
+    {
+      "method": "POST",
+      "path": "/prediksi/batch/preview"
+    },
+    {
+      "method": "POST",
+      "path": "/prediksi/konfirmasi"
+    },
+    {
+      "method": "POST",
+      "path": "/prediksi/konfirmasi/batch"
+    },
+    {
+      "method": "GET",
+      "path": "/prediksi/{id_mitra}"
+    },
+    {
+      "method": "DELETE",
+      "path": "/prediksi-uji/{id_prediksi}"
+    },
+    {
+      "method": "GET",
+      "path": "/stok"
+    },
+    {
+      "method": "GET",
+      "path": "/bahan-baku"
+    },
+    {
+      "method": "POST",
+      "path": "/bahan-baku"
+    },
+    {
+      "method": "PUT",
+      "path": "/bahan-baku/{id_bahan}"
+    },
+    {
+      "method": "DELETE",
+      "path": "/bahan-baku/{id_bahan}"
+    },
+    {
+      "method": "POST",
+      "path": "/pembelian-bahan-baku"
+    },
+    {
+      "method": "GET",
+      "path": "/resep/manage"
+    },
+    {
+      "method": "GET",
+      "path": "/produk"
+    },
+    {
+      "method": "PUT",
+      "path": "/resep/{id_resep}/harga"
+    },
+    {
+      "method": "POST",
+      "path": "/resep"
+    },
+    {
+      "method": "PUT",
+      "path": "/resep/{id_resep}"
+    },
+    {
+      "method": "DELETE",
+      "path": "/resep/{id_resep}"
+    },
+    {
+      "method": "POST",
+      "path": "/resep/{id_resep}/bahan"
+    },
+    {
+      "method": "PUT",
+      "path": "/resep-bahan/{id_resep_bahan}"
+    },
+    {
+      "method": "DELETE",
+      "path": "/resep-bahan/{id_resep_bahan}"
+    },
+    {
+      "method": "GET",
+      "path": "/resep/aktif"
+    },
+    {
+      "method": "GET",
+      "path": "/produksi/manual/preview"
+    },
+    {
+      "method": "GET",
+      "path": "/stok-puding"
+    },
+    {
+      "method": "POST",
+      "path": "/produksi"
+    },
+    {
+      "method": "POST",
+      "path": "/api/produksi/eksekusi"
+    },
+    {
+      "method": "GET",
+      "path": "/stock-opname"
+    },
+    {
+      "method": "GET",
+      "path": "/mutasi-stok/riwayat"
+    },
+    {
+      "method": "GET",
+      "path": "/stock-opname/{id_opname}"
+    },
+    {
+      "method": "POST",
+      "path": "/stock-opname"
+    },
+    {
+      "method": "PUT",
+      "path": "/stock-opname/{id_opname}"
+    },
+    {
+      "method": "DELETE",
+      "path": "/stock-opname/{id_opname}"
+    },
+    {
+      "method": "GET",
+      "path": "/kategori-keuangan"
+    },
+    {
+      "method": "GET",
+      "path": "/transaksi-keuangan"
+    },
+    {
+      "method": "POST",
+      "path": "/transaksi-keuangan"
+    },
+    {
+      "method": "PUT",
+      "path": "/transaksi-keuangan/{id_transaksi}"
+    },
+    {
+      "method": "DELETE",
+      "path": "/transaksi-keuangan/{id_transaksi}"
+    },
+    {
+      "method": "GET",
+      "path": "/keuangan"
+    }
+  ],
+  "required_request_fields": {
+    "PUT /resep/{id_resep}/harga": [
+      "harga_jual_per_potong"
+    ],
+    "POST /api/produksi/eksekusi": [
+      "id_rencana",
+      "tanggal_target",
+      "id_permintaan",
+      "prediksi_kebutuhan"
+    ],
+    "POST /data-harian/batch": [
+      "tanggal",
+      "items"
+    ]
+  },
+  "required_query_parameters": {
+    "GET /mutasi-stok/riwayat": [
+      "page",
+      "limit"
+    ],
+    "GET /transaksi-keuangan": [
+      "page",
+      "limit",
+      "tanggal",
+      "exclude_material_usage"
+    ]
+  }
+}

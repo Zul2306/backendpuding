@@ -15,3 +15,5 @@ Konfigurasi koneksi database dapat diubah dengan menyalin `.env.example`
 menjadi `.env`, lalu menyesuaikan `DATABASE_URL`.
 
 Dokumentasi API tersedia di `http://127.0.0.1:8000/docs`.
+
+Pemeriksaan kesiapan rilis tersedia di `/release/readiness`. Ikuti [proses rilis](RELEASE.md) sebelum mendistribusikan aplikasi baru.

@@ -1,5 +1,6 @@
 from sqlalchemy import (
     BigInteger,
+    JSON,
     Column,
     Date,
     DateTime,
@@ -37,6 +38,7 @@ class DataHarian(Base):
     jumlah_return = Column(Integer, default=0)
     jumlah_terjual = Column(Integer, default=0)
     mitra_tutup = Column(Boolean, nullable=False, default=False)
+    harga_jual_per_potong = Column(Numeric(15, 2), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -117,6 +119,7 @@ class StokBatch(Base):
     __tablename__ = "stok_batch"
 
     id_batch = Column(Integer, primary_key=True)
+    id_resep = Column(Integer, ForeignKey("resep.id_resep"), nullable=True, index=True)
     jumlah_awal = Column(Integer, nullable=False)
     jumlah_sisa = Column(Integer, nullable=False)
     tanggal_kadaluarsa = Column(DateTime, nullable=False)
@@ -175,6 +178,7 @@ class Resep(Base):
 
     id_resep = Column(Integer, primary_key=True)
     id_produk = Column(Integer, ForeignKey("produk.id_produk"), nullable=False)
+    metode_perencanaan = Column(Enum("prediksi", "manual"), nullable=False, default="manual")
     nama_resep = Column(String(100), nullable=False)
     harga_jual_per_potong = Column(Numeric(15, 2), nullable=False, default=0)
     hasil_per_loyang = Column(Integer, nullable=False, default=33)
@@ -248,3 +252,14 @@ class TransaksiKeuangan(Base):
     referensi_id = Column(BigInteger)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class EksekusiPrediksi(Base):
+    __tablename__ = "eksekusi_prediksi"
+
+    id_permintaan = Column(String(36), primary_key=True)
+    id_rencana = Column(Integer, ForeignKey("prediksi_harian.id_prediksi"), nullable=False)
+    tanggal_target = Column(Date, nullable=False, unique=True)
+    sidik_permintaan = Column(String(64), nullable=False)
+    hasil = Column(JSON, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
