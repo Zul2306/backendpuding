@@ -5,6 +5,17 @@ prediksi/produksi, dan tidak mengubah data laporan, stok, atau keuangan.
 
 ## Mengaktifkan
 
+Chrome dengan backend FastAPI Cloud (dari direktori `frontend`):
+
+```powershell
+flutter run -d chrome --dart-define=ENABLE_TEMP_EVALUATION=true --dart-define=API_BASE_URL=https://backendpuding-d747bbb2.fastapicloud.dev
+```
+
+Backend Cloud harus berisi kode evaluasi terbaru dan environment
+`ENABLE_TEMP_EVALUATION=true`. Di Chrome, tombol Unduh CSV memulai unduhan
+browser; lihat daftar Downloads. Aplikasi tidak dapat memeriksa apakah pengguna
+menyelesaikan atau membatalkan penyimpanan melalui browser.
+
 Backend (PowerShell, dari direktori `b`):
 
 ```powershell
@@ -48,7 +59,7 @@ pesan bahwa evaluasi belum tersedia; aplikasi tidak menjalankan alur produksi.
    nama mitra terbaca di Excel. File mencakup tanggal target, prediksi, aktual
    pada tanggal target yang sama, selisih, metrik, ID/SHA256 model dan peringatan.
    Simpan sebelum menutup halaman; hasil tidak disimpan ke database.
-   Di Android tombol memakai dialog dokumen bawaan. Ekspor belum tersedia di web.
+   Di Android tombol memakai dialog dokumen bawaan. Di Chrome file diunduh melalui browser.
 
 ## Metode dan batas interpretasi
 
