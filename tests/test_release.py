@@ -36,7 +36,7 @@ class ReleaseTest(unittest.TestCase):
         self.assertEqual(self.db.execute(text('SELECT COUNT(*) FROM eksekusi_prediksi')).scalar(), 0)
 
     def test_missing_price_endpoint_is_not_ready(self):
-        routes = [r for r in app.routes if r.path != '/resep/{id_resep}/harga']
+        routes = [r for r in app.routes if getattr(r, 'path', None) != '/resep/{id_resep}/harga']
         result = release_readiness(routes, self.db.connection())
         self.assertFalse(result['ready'])
         self.assertTrue(result['database']['ready'])

@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.release import API_VERSION, release_readiness
+from app.temporary_evaluation import router as temporary_evaluation_router
 from app.models import (BahanBaku, DataHarian, KategoriKeuangan, Mitra,
                         EksekusiPrediksi, LogStokRusak, ModelMitra, MutasiStok, PrediksiHarian,
                         Produk, Produksi, ProduksiDetail, Resep, ResepBahan,
@@ -32,6 +33,7 @@ from app.schemas import (BahanBakuCreate, BahanBakuUpdate, DataHarianBatchCreate
                          ProduksiEksekusiCreate, ResepHargaUpdate)
 
 app = FastAPI(title="API Prediksi Suplai Puding", version=API_VERSION)
+app.include_router(temporary_evaluation_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
