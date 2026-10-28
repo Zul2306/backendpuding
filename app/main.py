@@ -560,6 +560,31 @@ def daily_by_partner(id_mitra: int, db: Session = Depends(get_db)):
          "mitra_tutup": bool(x.mitra_tutup)} for x in rows]}
 
 
+@app.get("/riwayat-harian/detail")
+def daily_history_detail(tanggal: date, db: Session = Depends(get_db)):
+    # Include historical reports even when a partner is now inactive.
+    rows = (db.query(DataHarian, Mitra.nama_mitra)
+            .outerjoin(Mitra, Mitra.id_mitra == DataHarian.id_mitra)
+            .filter(DataHarian.tanggal == tanggal)
+            .order_by(Mitra.nama_mitra, DataHarian.id_mitra).all())
+    data = [{
+        "id_mitra": row.id_mitra,
+        "nama_mitra": name or f"Mitra #{row.id_mitra}",
+        "jumlah_suplai": row.jumlah_suplai,
+        "jumlah_return": row.jumlah_return,
+        "jumlah_terjual": row.jumlah_suplai - row.jumlah_return,
+        "mitra_tutup": bool(row.mitra_tutup),
+    } for row, name in rows]
+    return {
+        "tanggal": tanggal,
+        "jumlah_mitra": len(data),
+        "jumlah_suplai": sum(r["jumlah_suplai"] for r in data),
+        "jumlah_return": sum(r["jumlah_return"] for r in data),
+        "jumlah_terjual": sum(r["jumlah_terjual"] for r in data),
+        "data": data,
+    }
+
+
 @app.get("/riwayat-harian")
 def daily_history(
     tahun: int = Query(default_factory=lambda: date.today().year),

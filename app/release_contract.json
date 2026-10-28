@@ -5,6 +5,10 @@
   "required_endpoints": [
     {
       "method": "GET",
+      "path": "/riwayat-harian/detail"
+    },
+    {
+      "method": "GET",
       "path": "/mitra"
     },
     {
