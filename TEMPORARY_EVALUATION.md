@@ -12,7 +12,7 @@ flutter run -d chrome --dart-define=ENABLE_TEMP_EVALUATION=true --dart-define=AP
 ```
 
 Backend Cloud harus berisi kode evaluasi terbaru dan environment
-`ENABLE_TEMP_EVALUATION=true`. Di Chrome, tombol Unduh CSV memulai unduhan
+`ENABLE_TEMP_EVALUATION=true`. Di Chrome, tombol Unduh Excel atau Unduh CSV memulai unduhan
 browser; lihat daftar Downloads. Aplikasi tidak dapat memeriksa apakah pengguna
 menyelesaikan atau membatalkan penyimpanan melalui browser.
 
@@ -53,13 +53,17 @@ pesan bahwa evaluasi belum tersedia; aplikasi tidak menjalankan alur produksi.
    Pernyataan ini dicatat di hasil; fitur tidak mengubah metadata/model asli.
 4. Jalankan. Maksimal 31 hari, berakhir sebelum hari ini. Model aktif saat
    permintaan digunakan tetap untuk setiap mitra selama evaluasi; tidak melatih ulang.
-5. Tekan **Unduh CSV**, pilih lokasi melalui dialog **Save As** Windows, lalu
-   Simpan. Pembatalan dialog tidak menampilkan pesan berhasil. Kegagalan tulis
-   menampilkan pesan untuk mencoba lokasi lain. CSV memakai UTF-8 BOM agar
-   nama mitra terbaca di Excel. File mencakup tanggal target, prediksi, aktual
-   pada tanggal target yang sama, selisih, metrik, ID/SHA256 model dan peringatan.
-   Simpan sebelum menutup halaman; hasil tidak disimpan ke database.
-   Di Android tombol memakai dialog dokumen bawaan. Di Chrome file diunduh melalui browser.
+5. Tekan **Unduh Excel** untuk file `.xlsx` dengan tiga lembar:
+   **Ringkasan** (periode, metrik, penjelasan), **Per Mitra** (metrik dan metadata
+   model), serta **Rincian Harian** (prediksi vs aktual pada tanggal yang sama).
+   Judul kolom berwarna, baris judul dibekukan, filter tersedia, lebar kolom diatur.
+   Angka tampil tiga desimal dengan presisi asli tetap tersimpan; tanggal memakai
+   tipe tanggal Excel. Data yang dilewati tetap kosong, bukan nol.
+   **Unduh CSV** menyediakan 11 kolom rincian dengan judul bahasa Indonesia,
+   UTF-8 BOM, dan tanpa pengulangan metadata model pada setiap baris.
+   Di Chrome unduhan melalui browser (lihat Downloads). Windows dan Android
+   memakai dialog penyimpanan. Simpan sebelum menutup halaman; hasil tidak
+   disimpan ke database.
 
 ## Metode dan batas interpretasi
 
